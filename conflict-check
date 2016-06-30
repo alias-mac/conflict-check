@@ -1,0 +1,577 @@
+#!/usr/bin/env php
+<?php
+
+/*
+ * Copyright (c) 2008-2016 Filipe Guerra
+ * https://github.com/alias-mac/conflict-check
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+/**
+ * @file
+ * This script helps updating the current layout metadata for SugarCRM 7.0.
+ * Please read more about it here:
+ * https://github.com/alias-mac/conflict-check#readme
+ */
+
+// confirm we are running this using the cli
+if (php_sapi_name() !== "cli") {
+    throw new \RuntimeException("This is only supported from the terminal");
+}
+
+if (version_compare(PHP_VERSION, '5.4.', '<')) {
+    throw new \RuntimeException("This script requires php 5.4.0 version or above.");
+}
+
+process($argv);
+
+/**
+ * Process this command with the options passed on the CLI.
+ *
+ * @param array $argv Arguments passed in the CLI.
+ */
+function process(array $argv)
+{
+
+    // f maps to file, d to dir, p to path, h to helper and v is verbose
+    $shortOpts = "f::d::p::hv";
+    $longOpts = [
+        "file::",
+        "dir::",
+        "path::",
+        "help",
+        "dry-run",
+    ];
+    $opts = getopt($shortOpts, $longOpts);
+
+    // try to get the required options (a directory or a file)
+    if (!empty($opts['d'])) {
+        $dirs = $opts['d'];
+    }
+    if (!empty($opts['dir'])) {
+        $dirs = $opts['dir'];
+    }
+    if (!empty($opts['f'])) {
+        $files = $opts['f'];
+    }
+    if (!empty($opts['file'])) {
+        $files = $opts['file'];
+    }
+
+    // no required arguments given or help requested
+    if ((empty($files) && empty($dirs)) || isset($opts['h']) || isset($opts['help'])) {
+        displayHelp($argv[0]);
+        exit(0);
+    }
+
+    // the sugar root path from where we want to include the helpers
+    // defaults to current directory
+    $path = getcwd();
+
+    // try to get the path on the options
+    if (!empty($opts['p'])) {
+        $path = $opts['p'];
+    }
+    if (!empty($opts['path'])) {
+        $path = $opts['path'];
+    }
+
+    // do a small check on the current SugarCRM path to prevent mistakes
+    if (!file_exists("$path/sugar_version.php")) {
+        throw new \RuntimeException(
+            sprintf(
+                "Path '%s' is not of a valid sugar root to run this script.",
+                $path
+            )
+        );
+    }
+
+    // prepare to pretend we are in sugar directory (will be restored after)
+    $origDir = getcwd();
+    chdir($path);
+
+    // make sure we can pretend we are a valid sugar entry point
+    if (!defined('sugarEntry')) {
+        define('sugarEntry', true);
+        define('SUGAR_BASE_DIR', $path);
+    }
+
+    // make sure SugarConfig object is available
+    require_once 'include/SugarObjects/SugarConfig.php';
+    // autoloader is our friend
+    require_once 'include/utils/autoloader.php';
+
+    // and because sugar...
+    require_once 'include/utils/array_utils.php';
+    require_once 'include/utils.php';
+    require_once 'include/SugarCache/SugarCache.php';
+
+    \SugarAutoLoader::init();
+    \Sugarcrm\Sugarcrm\Security\InputValidation\InputValidation::initService();
+
+    $GLOBALS['log'] = LoggerManager::getLogger('SugarCRM');
+    $GLOBALS['timedate'] = TimeDate::getInstance();
+
+    global $beanList, $beanFiles, $moduleList, $bwcModules, $sugar_config, $current_user;
+    require_once 'include/modules.php';
+
+    $sugar_config['external_cache_disabled'] = true;
+    $sugar_config['default_language'] = 'en_us';
+
+    $options = [
+        'verbose' => isset($opts['v']),
+    ];
+
+    $checker = new \ViewDef_Checker($options);
+
+    // file param given (can be an array)
+    if (!empty($files)) {
+        $checker->addFiles($files);
+    }
+
+    // dir param given (can be an array)
+    if (!empty($dirs)) {
+        if (!is_array($dirs)) {
+            $dirs = [$dirs];
+        }
+        foreach ($dirs as $dir) {
+            $dir = rtrim($dir, '/');
+            $files = glob("$dir/*/*.php", GLOB_NOSORT | GLOB_BRACE);
+
+            if ($files === false) {
+                throw new \RuntimeException(
+                    sprintf(
+                        "Unable to search for metadata files on given path: '%s'.",
+                        $dir
+                    )
+                );
+            }
+
+            $checker->addFiles($files);
+        }
+    }
+
+    $checker->run();
+
+    // restore to our original directory
+    chdir($origDir);
+}
+
+/**
+ * Displays/prints help on the CLI.
+ *
+ * @param string $scriptName the script name for this command.
+ */
+function displayHelp($scriptName)
+{
+    echo <<<HELP
+usage:  $scriptName [-p="path/to/sugarcrm"] -d="directory/to/check"
+        $scriptName [-path="path/to/sugarcrm"] -d="directory/to/check" -d="directory2/to/check"
+        $scriptName [-path="path/to/sugarcrm"] -d="directories/*/to/*/check"
+        $scriptName [-path="path/to/sugarcrm"] --dir="directory/to/check"
+        $scriptName [-p="path/to/sugarcrm"] -f="file/to/check"
+        $scriptName [-path="path/to/sugarcrm"] --file="file/to/check"
+        $scriptName [-path="path/to/sugarcrm"] --file="file/to/check" -v
+        $scriptName [-path="path/to/sugarcrm"] -f="file1/to/check" -f="file2/to/check"
+
+Files and/or directories to check need to be relative to SugarCRM path.
+
+HELP;
+
+}
+
+/**
+ * ViewDef checker to help this script to run a lot easier.
+ *
+ * Can't use namespaces in order to be able to use script header and use the
+ * download/execute functionality.
+ */
+class ViewDef_Checker
+{
+    /**
+     * @var bool TRUE if you want to be verbose.
+     * Defaults to FALSE.
+     */
+    protected $verbose = false;
+
+    /**
+     * @var array of files to be checked.
+     */
+    protected $files = [];
+
+    /**
+     * Creates a checker based on a configuration given.
+     *
+     * @param array $config configuration options.
+     * The possible configuration values are:
+     *   - (boolean) verbose TRUE if you want to show more info.
+     *
+     * @return ViewDef_Checker
+     *
+     * @throws \InvalidArgumentException if configuration given doesn't match the expected
+     */
+    public function __construct(array $config = [])
+    {
+        if (empty($config)) {
+            return $this;
+        }
+
+        static $map = [
+            'verbose' => 'bool',
+        ];
+
+        foreach ($map as $param => $type) {
+            if (!settype($config[$param], $type)) {
+                throw new \InvalidArgumentException(
+                    sprintf("Invalid configuration option '%s' given.", $param)
+                );
+            }
+            $this->$param = $config[$param];
+        }
+
+        return $this;
+    }
+
+    /**
+     * Add a file to be checked.
+     *
+     * @param string|array $files the file to be checked.
+     *
+     * @return ViewDef_Checker the current instance (for chaining).
+     *
+     * @throws \InvalidArgumentException if one of the files isn't a metadata
+     *   (PHP) file.
+     * @throws \RuntimeException if one of the files given doesn't exist or if
+     *   we don't have enough permissions to check that given file.
+     *
+     * @api
+     */
+    public function addFiles($files)
+    {
+        // support mixed (array and string)
+        if (!is_array($files)) {
+            $files = [$files];
+        }
+
+        foreach ($files as $file) {
+            $this->addFile($file);
+        }
+    }
+
+    /**
+     * Add a file to be checked.
+     *
+     * @param string $file the file to be checked.
+     *
+     * @return ViewDef_Checker the current instance (for chaining).
+     *
+     * @throws \InvalidArgumentException if the file isn't a metadata (PHP)
+     *   file or wrong argument given.
+     * @throws \RuntimeException if the file given doesn't exist or if we don't
+     *   have enough permissions to run the checker in this file.
+     */
+    protected function addFile($file)
+    {
+        if (empty($file) || !is_string($file)) {
+            throw new \InvalidArgumentException();
+        }
+
+        $pathInfo = pathinfo($file);
+        if (empty($pathInfo['extension']) || $pathInfo['extension'] !== 'php') {
+            throw new \InvalidArgumentException(
+                sprintf(
+                    "File '%s' given isn't a valid metadata (.php) file.",
+                    $file
+                )
+            );
+        }
+
+        // module views are defined by:
+        // $viewdefs[Accounts]['mobile']['view']['create']
+        // we need a module because vardefs exist in modules
+        // TODO check SugarObjects/templates (needs manual checking)
+        $pathArr = explode(DIRECTORY_SEPARATOR, $pathInfo['dirname']);
+        if (reset($pathArr) === 'clients') {
+            throw new \RuntimeException(
+                sprintf('The files to check need to be in a module. %s does not belong to a module', $file)
+            );
+        }
+
+        if (!is_readable($file)) {
+            throw new \RuntimeException(
+                sprintf(
+                    "File '%s' doesn't exist or doesn't have the correct permissions (read).",
+                    $file
+                )
+            );
+        }
+
+        // this prevents duplicates in an easy way
+        $this->files[$file] = true;
+        $this->log("File '%s' added to the check queue.", $file);
+
+        return $this;
+    }
+
+    /**
+     * Logs a message to stdoutput if verbose is active.
+     *
+     * @param string $format see sprintf function
+     * @param mixed $args [optional] see sprintf function
+     * @param mixed $_ [optional] see sprintf function
+     *
+     * @see sprintf() for params info
+     */
+    private function log($format, $args = null, $_ = null)
+    {
+        if ($this->verbose) {
+            echo call_user_func_array('sprintf', func_get_args()) . "\n";
+        }
+    }
+
+    /**
+     * Run the checker against all files previously added.
+     *
+     * @throws \RuntimeException if no files were given to this checker.
+     *
+     * @api
+     */
+    public function run()
+    {
+        if (empty($this->files)) {
+            throw new \RuntimeException('No files to check. Check your script!');
+        }
+
+        foreach ($this->getFiles() as $file) {
+            $this->check($file);
+        }
+    }
+
+    /**
+     * Returns the list of files that will be checked.
+     *
+     * @return array the list of files to checked.
+     */
+    public function getFiles()
+    {
+        return array_keys($this->files);
+    }
+
+    /**
+     * Checks if a View is using properties on the fields that conflict or
+     * override the ones in the vardefs (field defs).
+     *
+     * @param string $file the file to be checked.
+     */
+    protected function check($file)
+    {
+        $viewdefs = $this->loadViewDef($file);
+        if (empty($viewdefs)) {
+            return;
+        }
+
+        $module = array_keys($viewdefs)[0];
+        $view = reset(reset(reset($viewdefs)));
+        $viewName = array_keys($view)[0];
+        $def = reset($view);
+
+        if (empty($def['panels'])) {
+            $this->log("[SKIP]\tView definition without panels: '%s'.", $viewName);
+            return;
+        }
+
+        $fields = $this->getFieldDefs($module);
+        foreach ($def['panels'] as $panel) {
+            // cuz DNB is different...
+            if (!empty($panel['rows'])) {
+                foreach ($panel['rows'] as $row) {
+                    $this->checkFields($row, $fields);
+                }
+                if (empty($panel['fields'])) {
+                    continue;
+                }
+            }
+
+            if (empty($panel['fields'])) {
+                $this->log("[skip]\tView panel in %s without fields: '%s'.", $viewName, var_export($panel, true));
+                continue;
+            }
+
+            $this->checkFields($panel, $fields, $viewName, $file);
+        }
+    }
+
+    /**
+     * Check if the fields in a panel have safe properties (not overriding
+     * vardefs).
+     *
+     * Logs a warning for different values and an error for different types.
+     *
+     * @param array $panel The panel to check for Field properties.
+     * @param array $fields The Field defs (vardefs) from the module (to check
+     *   against).
+     * @param string $viewName The view name of the panel definition.
+     * @param string $file The full file path (from sugarcrm root) of the view.
+     */
+    private function checkFields($panel, $fields, $viewName, $file)
+    {
+        static $safeProps = [
+            'name',
+            'type',
+        ];
+
+        foreach ($panel['fields'] as $fieldViewDef) {
+            if (!is_array($fieldViewDef)) {
+                $this->log("[SKIP]\tField definition as string: '%s'.", $fieldViewDef);
+                continue;
+            }
+
+            if (empty($fieldViewDef['name'])) {
+                $this->log("[SKIP]\tField definition without mapping with vardefs.");
+                continue;
+            }
+
+            $name = $fieldViewDef['name'];
+            if (empty($fields[$name])) {
+                $this->log("[SKIP]\tField definition not in vardefs: '%s'.", $name);
+                continue;
+            }
+            $field = $fields[$name];
+            foreach ($fieldViewDef as $key => $value) {
+                if (in_array($key, $safeProps)) {
+                    continue;
+                }
+
+                if (!array_key_exists($key, $field)) {
+                    continue;
+                }
+
+                $logLevel = 'WARN';
+                if (gettype($value) !== gettype($field[$key])) {
+                    $logLevel = 'ERROR';
+                }
+
+                echo sprintf(
+                    "[%s]\tFound conflict in '%s' with property '%s' on field '%s': '%s' vs '%s'.\n" .
+                    "\tPlease fix this in %s\n",
+                    $logLevel,
+                    $viewName,
+                    $key,
+                    $name,
+                    var_export($value, true),
+                    var_export($field[$key], true),
+                    $file
+                );
+            }
+        }
+    }
+
+    /**
+     * Loads the View definition from a given file.
+     *
+     * @param string $file The file to load the View defs from .
+     * @return array|null The View definition or `null` if not found.
+     */
+    private function loadViewDef($file)
+    {
+        $viewdefs = null;
+        // the viewdefs should be returned on the file ... but since they aren't...
+        include $file;
+
+        if (empty($viewdefs)) {
+            // warn about empty view defs
+            $message = sprintf(
+                "Your viewdefs for '%s' are empty. Please confirm your file.\n",
+                $file
+            );
+            trigger_error($message, E_USER_WARNING);
+            $this->log($message);
+            // and do nothing
+            return null;
+        }
+
+        return $viewdefs;
+    }
+
+    /**
+     * Returns the Field definitions (aka vardefs) from the given Module.
+     *
+     * This function uses a cached version of the field definitions, meaning
+     * that you can get different results from the actual file while running
+     * it.
+     *
+     * @param string $module The module to get the Field defs from.
+     * @return array The field defs for the given module (can be cached).
+     */
+    private function getFieldDefs($module)
+    {
+        static $defs = [];
+
+        if (empty($defs[$module])) {
+            $defs[$module] = $this->loadFieldDefs($module);
+        }
+
+        return $defs[$module];
+    }
+
+    /**
+     * Loads and returns the Field definitions (aka vardefs) from the files for
+     * a given Module.
+     *
+     * This uses SugarCRM's classes and does not use any cache, thus might not
+     * be performant. Use it wisely.
+     *
+     * @param string $module The module to get the Field defs from.
+     * @return array|null The field defs for the given module or `null` if not
+     *   found.
+     */
+    private function loadFieldDefs($module)
+    {
+        static $skipModules = [
+            'Administration',
+            'ProjectTask',
+            'RevenueLineItems',
+            'Tags',
+        ];
+
+        if (in_array($module, $skipModules)) {
+            // ProjectTask need to be manually checked
+            $message = sprintf(
+                "Your module %s is not supported by this script. Sorry.\n",
+                $module
+            );
+            trigger_error($message, E_USER_WARNING);
+            $this->log($message);
+
+            return null;
+        }
+
+        global $dictionary;
+
+        $object = BeanFactory::getObjectName($module);
+        // because Cases...
+        if ($object === 'aCase') {
+            $object = 'Case';
+        }
+
+        VardefManager::refreshVardefs($module, $object, null, false, [
+            'ignore_rel_calc_fields' => true,
+        ]);
+
+        if (empty($dictionary[$object]) || empty($dictionary[$object]['fields'])) {
+            // warn about modules without fields in vardefs
+            $message = sprintf(
+                "Your module %s does not have dictionary or fields.\n",
+                $module
+            );
+            trigger_error($message, E_USER_WARNING);
+            $this->log($message);
+
+            return null;
+        }
+
+        return $dictionary[$object]['fields'];
+    }
+}
